@@ -24,6 +24,21 @@ import {
 } from '../../gen/block-engine/auth';
 import {unixTimestampFromDate} from './utils';
 
+// Result type for token refresh operations
+type RefreshResult = 
+  | { success: true }
+  | { success: false; reason: 'rate_limited'; retryAfter?: number }
+  | { success: false; reason: 'auth_failed'; error: string }
+  | { success: false; reason: 'invalid_response'; error: string }
+  | { success: false; reason: 'network_error'; error: string };
+
+// Export simplified error type for SDK users
+export type AuthRefreshError = {
+  reason: 'rate_limited' | 'auth_failed' | 'network_error' | 'invalid_response';
+  message: string;
+  retryAfter?: number;
+};
+
 // Intercepts requests and sets the auth header.
 export const authInterceptor = (authProvider: AuthProvider): Interceptor => {
   return (opts: InterceptorOptions, nextCall: NextCall) => {
@@ -61,16 +76,22 @@ export class AuthProvider {
   private readonly authKeypair: Keypair;
   private accessToken: Jwt | undefined;
   private refreshToken: Jwt | undefined;
-  private refreshing: Promise<void> | null = null;
+  private refreshing: Promise<RefreshResult | null> | null = null;
 
   constructor(client: AuthServiceClient, authKeypair: Keypair) {
     this.client = client;
     this.authKeypair = authKeypair;
+    this.fullAuth((accessToken: Jwt, refreshToken: Jwt) => {
+      this.accessToken = accessToken;
+      this.refreshToken = refreshToken;
+    });
   }
 
-  // Injects the current access token into the provided callback.
-  // If it's expired then refreshes, if the refresh token is expired then runs the full auth flow.
-  public injectAccessToken(callback: (accessToken: Jwt) => void) {
+  // If access token expired then refreshes, if the refresh token is expired then runs the full auth flow.
+  public injectAccessToken(
+    callback: (accessToken: Jwt) => void,
+    errorCallback?: (error: AuthRefreshError) => void
+  ) {
     if (
       !this.accessToken ||
       !this.refreshToken ||
@@ -96,45 +117,119 @@ export class AuthProvider {
       });
     }
 
-    this.refreshing.then(() => {
-      if (this.accessToken) {
-        callback(this.accessToken);
+    this.refreshing.then((result) => {
+      if (result?.success) {
+        // Successful refresh - we have a valid access token
+        callback(this.accessToken!);
+      } else if (result && errorCallback) {
+        // Refresh failed - let user decide what to do
+        const authError: AuthRefreshError = {
+          reason: result.reason,
+          message: this.getErrorMessage(result),
+          ...(result.reason === 'rate_limited' && result.retryAfter !== undefined && { retryAfter: result.retryAfter })
+        };
+        errorCallback(authError);
+      } else if (result) {
+        console.error(`Token refresh failed: ${result.reason} - ${this.getErrorMessage(result)}`);
+      }
+    }).catch((error) => {
+      // This should never happen since refreshAccessToken never rejects now
+      console.error('Unexpected error in token refresh flow:', error);
+      if (errorCallback) {
+        errorCallback({
+          reason: 'network_error',
+          message: 'Unexpected error in token refresh flow'
+        });
       }
     });
   }
 
-  // Refresh access token.
-  private async refreshAccessToken() {
-    return new Promise<void>((resolve, reject) => {
+  // Helper method to safely get error message from RefreshResult
+  private getErrorMessage(result: Exclude<RefreshResult, { success: true }>): string {
+    switch (result.reason) {
+      case 'rate_limited':
+        return 'Request rate limited';
+      case 'auth_failed':
+      case 'invalid_response':
+      case 'network_error':
+        return result.error;
+      default:
+        return 'Token refresh failed';
+    }
+  }
+
+  // Refresh access token with proper error reporting
+  private async refreshAccessToken(): Promise<RefreshResult> {
+    return new Promise<RefreshResult>((resolve) => {
       this.client.refreshAccessToken(
         {
           refreshToken: this.refreshToken?.token,
         } as RefreshAccessTokenRequest,
         async (e: ServiceError | null, resp: RefreshAccessTokenResponse) => {
           if (e) {
-            return reject(e);
-          }
+            // Handle different types of errors with specific reasons
+            if (e.code === 8) { // RESOURCE_EXHAUSTED (gRPC equivalent of 429)
+              resolve({ 
+                success: false, 
+                reason: 'rate_limited'
+              });
+              return;
+            }
+            
+            if (e.code === 16) { // UNAUTHENTICATED
+              resolve({ 
+                success: false, 
+                reason: 'auth_failed', 
+                error: e.message 
+              });
+              return;
+            }
 
-          if (!AuthProvider.isValidToken(resp.accessToken)) {
-            return reject(`received invalid access token ${resp.accessToken}`);
+            if (e.code === 14) { // UNAVAILABLE
+              resolve({ 
+                success: false, 
+                reason: 'network_error', 
+                error: e.message 
+              });
+              return;
+            }
+
+            // Default to auth failure for other error codes
+            resolve({ 
+              success: false, 
+              reason: 'auth_failed', 
+              error: e.message 
+            });
+            return;
           }
+  
+          if (!AuthProvider.isValidToken(resp.accessToken)) {
+            resolve({ 
+              success: false, 
+              reason: 'invalid_response', 
+              error: 'Received invalid access token from server' 
+            });
+            return;
+          }
+          
           this.accessToken = new Jwt(
             resp.accessToken?.value || '',
             unixTimestampFromDate(resp.accessToken?.expiresAtUtc || new Date())
           );
-          resolve();
+          
+          resolve({ success: true });
         }
       );
     });
   }
 
   // Creates an AuthProvider object, and asynchronously performs full authentication flow.
-  public static async create(
+  public static create(
     client: AuthServiceClient,
     authKeypair: Keypair
-  ): Promise<AuthProvider> {
+  ): AuthProvider {
     const provider = new AuthProvider(client, authKeypair);
-    await provider.fullAuth((accessToken: Jwt, refreshToken: Jwt) => {
+    provider.fullAuth((accessToken: Jwt, refreshToken: Jwt) => {
       provider.accessToken = accessToken;
       provider.refreshToken = refreshToken;
     });
