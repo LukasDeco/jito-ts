@@ -1,7 +1,10 @@
 {
-  "author": "Jito Team <team@jito.wtf>",
+  "author": "Drift Labs",
   "license": "Apache-2.0",
-  "name": "jito-ts",
+  "name": "@drift-labs/jito-ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "version": "4.2.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
