@@ -35,7 +35,8 @@ import {
 } from 'superstruct';
 import type {Agent as NodeHttpAgent} from 'http';
 import {Agent as NodeHttpsAgent} from 'https';
-import fetchImpl, {Response} from './fetch-impl';
+import fetchImpl from './fetch-impl';
+import type {Response as NodeFetchResponse} from 'node-fetch';
 import HttpKeepAliveAgent, {
   HttpsAgent as HttpsKeepAliveAgent,
 } from 'agentkeepalive';
@@ -258,22 +259,27 @@ function createRpcClient(
     }
   }
 
-  let fetchWithMiddleware: FetchFn | undefined;
+  let fetchWithMiddleware:
+    | ((url: string, options: any) => Promise<NodeFetchResponse>)
+    | undefined;
 
   if (fetchMiddleware) {
-    fetchWithMiddleware = async (info, init) => {
-      const modifiedFetchArgs = await new Promise<Parameters<FetchFn>>(
+    fetchWithMiddleware = async (url: string, options: any) => {
+      const modifiedFetchArgs = await new Promise<[string, any]>(
         (resolve, reject) => {
           try {
-            fetchMiddleware(info, init, (modifiedInfo, modifiedInit) =>
-              resolve([modifiedInfo, modifiedInit])
+            fetchMiddleware(url, options, (modifiedInfo, modifiedInit) =>
+              resolve([modifiedInfo as string, modifiedInit])
             );
           } catch (error) {
             reject(error);
           }
         }
       );
-      return await fetch(...modifiedFetchArgs);
+      return (await fetch(
+        modifiedFetchArgs[0],
+        modifiedFetchArgs[1]
+      )) as NodeFetchResponse;
     };
   }
 
@@ -292,13 +298,13 @@ function createRpcClient(
 
     try {
       let too_many_requests_retries = 5;
-      let res: Response;
+      let res: NodeFetchResponse;
       let waitTime = 500;
       for (;;) {
         if (fetchWithMiddleware) {
           res = await fetchWithMiddleware(url, options);
         } else {
-          res = await fetch(url, options);
+          res = (await fetch(url, options)) as NodeFetchResponse;
         }
 
         if (res.status !== 429 /* Too many requests */) {
@@ -440,10 +446,12 @@ export class JitoRpcConnection extends Connection {
           console.error(res.error.message, logTrace);
         }
       }
-      throw new SendTransactionError(
-        'failed to simulate bundle: ' + res.error.message,
-        logs
-      );
+      throw new SendTransactionError({
+        action: 'simulate',
+        signature: '',
+        transactionMessage: 'failed to simulate bundle: ' + res.error.message,
+        logs,
+      });
     }
     return res.result;
   }
