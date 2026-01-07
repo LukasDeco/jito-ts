@@ -1,5 +1,6 @@
 {
   "author": "Drift Labs",
+  "description": "Jito Typescript SDK, forked by Drift Labs",
   "license": "Apache-2.0",
   "name": "@drift-labs/jito-ts",
   "publishConfig": {
